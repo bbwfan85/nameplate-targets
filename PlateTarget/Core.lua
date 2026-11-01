@@ -9,17 +9,20 @@ ns.PT = PT
 ns.defaults = {
 	enabled        = true,
 	font           = "Friz Quadrata TT",
-	fontSize       = 12,
+	fontSize       = 16,
 	outline        = "OUTLINE",      -- NONE, OUTLINE, THICKOUTLINE
-	shadow         = false,
+	shadow         = true,
 	position       = "BELOW",        -- BELOW or ABOVE the health bar
 	offsetX        = 0,
 	offsetY        = -2,
 	anchorMode     = "AUTO",         -- AUTO (find health bar) or PLATE (raw nameplate frame)
+	avoidBars      = true,           -- move past cast/power bars on the same side
+	smoothStack    = true,           -- slide instead of snapping when they appear
 	format         = "> NAME <",     -- NAME is replaced by the target's name
 	nameMode       = "FIRST",        -- FIRST (first name only) or FULL (with surname / realm)
 	factionIcon    = true,           -- Horde/Alliance icon before player names
 	factionIconSize = 0,             -- 0 = match text height
+	factionOnlyEnemy = true,         -- icon only for the opposite faction
 	youMode        = "TEXT",         -- TEXT (custom text) or NAME (your own name)
 	youText        = ">> YOU <<",
 	youColor       = { r = 1, g = 0.2, b = 0.2 },
@@ -131,6 +134,9 @@ local function GetHolder(plate)
 		h.text:SetWordWrap(false)
 		h.you = h:CreateFontString(nil, "OVERLAY")
 		h.you:SetWordWrap(false)
+		h.strings = { h.text, h.you }
+		-- Recheck the anchor as soon as we're shown again (see AnchorStale).
+		h:SetScript("OnShow", function(self) self.recheckIn = 0 end)
 		holders[plate] = h
 		ApplyFont(h)
 	end
@@ -163,22 +169,21 @@ local function HealthFromKeys(frame)
 	if type(hc) == "table" and hc.healthBar then return hc.healthBar end
 end
 
--- Topmost visible StatusBar under a frame (health bars sit above cast bars).
-local function FindStatusBar(frame, depth, best)
-	if depth > 3 then return best end
+-- First visible StatusBar under a frame. Midnight forbids measuring
+-- nameplate regions, so we can't compare positions to pick the top one.
+local function FindStatusBar(frame, depth)
+	if depth > 3 then return end
 	for _, child in ipairs({ frame:GetChildren() }) do
 		if not child:IsForbidden() and Visible(child) then
-			if child:IsObjectType("StatusBar") then
-				local top, bestTop = child:GetTop(), best and best:GetTop()
-				if top and not IsSecret(top) and (not bestTop or top > bestTop) then best = child end
-			end
-			best = FindStatusBar(child, depth + 1, best)
+			if child:IsObjectType("StatusBar") then return child end
+			local bar = FindStatusBar(child, depth + 1)
+			if bar then return bar end
 		end
 	end
-	return best
 end
 
--- Returns the region to attach to, plus a short label for /ptarget debug.
+-- Returns the region to attach to, a short label for /ptarget debug, and
+-- whether it's only a fallback (no health bar found yet).
 local function ResolveAnchor(plate)
 	if PT.db.anchorMode == "PLATE" then return plate, "nameplate frame (forced)" end
 
@@ -202,28 +207,197 @@ local function ResolveAnchor(plate)
 	if Visible(blizz) then
 		local bar = HealthFromKeys(blizz)
 		if bar then return bar, "Blizzard health bar" end
-		return blizz, "Blizzard unit frame"
+		return blizz, "Blizzard unit frame", true
 	end
 
-	return plate, "nameplate frame (fallback)"
+	return plate, "nameplate frame (fallback)", true
 end
 
-local function Anchor(h, plate)
-	local anchor, kind = ResolveAnchor(plate)
+---------------------------------------------------------------------------
+-- Bar stacking: when a cast bar shows up on the same side of the health bar
+-- as the text, slide the text past it.
+--
+-- Midnight forbids measuring nameplate regions (GetTop/GetBottom/... throw
+-- "Can't measure restricted regions"), so this never reads screen positions.
+-- It finds cast bars by the names nameplate addons give them, and works out
+-- the distance from the bar's own height plus how it's attached.
+---------------------------------------------------------------------------
+-- EllesmereUI: plate.cast | ElvUI: unitFrame.Castbar
+local CAST_KEYS = { "cast", "castBar", "castbar", "Castbar", "CastBar" }
+
+-- Each tracked cast bar is { show = frame whose visibility means "casting",
+-- size = frame whose height is the space taken, gap = space between it and
+-- the health bar }.
+local function FindCastBars(anchor, plate)
+	local bars, seen = {}, {}
+	if anchor == plate then return bars end
+	local owner = anchor:GetParent()
+	for _ = 1, 2 do
+		if not owner or owner == plate then break end
+		-- Default UI: UnitFrame.CastBarsContainer holds the bar plus the spell
+		-- name line under it, and sits castBarToHealthBarSpacing below health.
+		local container = owner.CastBarsContainer
+		if type(container) == "table" and type(container.castBar) == "table" and not seen[container.castBar] then
+			local opts = NamePlateSetupOptions
+			local gap = type(opts) == "table" and tonumber(opts.castBarToHealthBarSpacing) or 0
+			bars[#bars + 1] = { show = container.castBar, size = container, gap = gap }
+			seen[container.castBar] = true
+		end
+		for _, key in ipairs(CAST_KEYS) do
+			local bar = owner[key]
+			if type(bar) == "table" and bar ~= anchor and not seen[bar]
+				and bar.IsObjectType and bar:IsObjectType("Frame") then
+				bars[#bars + 1] = { show = bar, size = bar, gap = 0 }
+				seen[bar] = true
+			end
+		end
+		owner = owner:GetParent()
+	end
+	return bars
+end
+
+local function Readable(v)
+	return v ~= nil and not IsSecret(v)
+end
+
+-- Whether a cast bar is currently drawn (cast bars fade out before hiding).
+local function BarShowing(entry)
+	local bar = entry.show
+	local shown = bar:IsVisible()
+	if not Readable(shown) or not shown then return false end
+	local alpha = bar.GetEffectiveAlpha and bar:GetEffectiveAlpha() or bar:GetAlpha()
+	return Readable(alpha) and alpha > 0.05
+end
+
+-- Distance (in the holder's units) the text must move to clear a cast bar,
+-- or nil when the text is above the health bar. Midnight forbids measuring
+-- nameplate regions (positions and GetPoint), so cast bars are assumed to
+-- hang under the health bar, as they do in EllesmereUI, ElvUI and the
+-- default UI; only size and scale are read.
+local function ClearanceFor(h, entry, below)
+	if not below then return end
+	local frame = entry.size
+	local height = frame:GetHeight()
+	if not Readable(height) then return end
+	local barScale, ourScale = frame:GetEffectiveScale(), h:GetEffectiveScale()
+	local ratio = (Readable(barScale) and Readable(ourScale) and ourScale > 0) and barScale / ourScale or 1
+	return math.max(0, height + entry.gap) * ratio
+end
+
+-- Extra distance needed to clear whichever tracked cast bars are showing.
+local function StackOffset(h)
+	if not PT.db.avoidBars or not h.bars then return 0 end
+	local below = PT.db.position ~= "ABOVE"
+	local extra = 0
+	for _, entry in ipairs(h.bars) do
+		if BarShowing(entry) then
+			local need = ClearanceFor(h, entry, below)
+			if need and need > extra then extra = need end
+		end
+	end
+	return extra
+end
+
+local function PlaceText(h, extra)
 	local db = PT.db
+	for _, fs in ipairs(h.strings) do
+		fs:ClearAllPoints()
+		if db.position == "ABOVE" then
+			fs:SetPoint("BOTTOM", h, "TOP", db.offsetX, db.offsetY + extra)
+		else
+			fs:SetPoint("TOP", h, "BOTTOM", db.offsetX, db.offsetY - extra)
+		end
+	end
+end
+
+local STACK_POLL = 0.05  -- seconds between bar checks
+local STACK_SPEED = 18   -- higher = faster slide
+local ANCHOR_RECHECK = 0.25 -- seconds between anchor sanity checks
+
+local function IsUnder(f, ancestor)
+	while f do
+		if f == ancestor then return true end
+		f = f:GetParent()
+	end
+	return false
+end
+
+local Anchor
+
+-- Custom plates (EllesmereUI queues its frame) can attach after we first
+-- anchor, and pooled frames get handed to other units. Re-anchor if we only
+-- found a fallback, or our anchor left this plate or went invisible.
+local function AnchorStale(h)
+	return h.fallback or not IsUnder(h.anchor, h.plate) or not Visible(h.anchor)
+end
+
+-- Run fn, keeping the text working if the client rejects a frame query
+-- (Midnight restrictions); the error is kept for /ptarget debug.
+local function Guarded(h, fn, ...)
+	local ok, result = pcall(fn, ...)
+	if ok then return result end
+	h.lastError = tostring(result)
+end
+
+-- Stack offset, or 0 when it can't be worked out.
+local function SafeStackOffset(h)
+	local v = Guarded(h, StackOffset, h)
+	if type(v) ~= "number" or IsSecret(v) then return 0 end
+	return v
+end
+
+local function Recheck(h)
+	if AnchorStale(h) then
+		Anchor(h, h.plate)
+	else
+		-- Bars can be added after we anchor (lazily built cast bars).
+		h.bars = FindCastBars(h.anchor, h.plate)
+	end
+end
+
+local function StackOnUpdate(h, elapsed)
+	h.recheckIn = (h.recheckIn or 0) - elapsed
+	if h.recheckIn <= 0 then
+		h.recheckIn = ANCHOR_RECHECK
+		if h.plate then Guarded(h, Recheck, h) end
+	end
+	h.pollIn = (h.pollIn or 0) - elapsed
+	if h.pollIn <= 0 then
+		h.pollIn = STACK_POLL
+		h.stackTarget = SafeStackOffset(h)
+	end
+	local target, cur = h.stackTarget or 0, h.stack or 0
+	if cur == target then return end
+	if PT.db.smoothStack then
+		cur = cur + (target - cur) * math.min(1, elapsed * STACK_SPEED)
+		if math.abs(target - cur) < 0.3 then cur = target end
+	else
+		cur = target
+	end
+	h.stack = cur
+	PlaceText(h, cur)
+end
+
+function Anchor(h, plate)
+	-- Install the updater first so a later failure can't stop rechecks.
+	h:SetScript("OnUpdate", StackOnUpdate)
+	local anchor, kind, fallback = ResolveAnchor(plate)
 	h.anchorKind = kind
+	h.anchor = anchor
+	h.plate = plate
+	h.fallback = fallback
 	h:ClearAllPoints()
 	h:SetAllPoints(anchor)
 	h:SetFrameStrata(anchor:GetFrameStrata())
 	h:SetFrameLevel(anchor:GetFrameLevel() + 10)
-	for _, fs in ipairs({ h.text, h.you }) do
-		fs:ClearAllPoints()
-		if db.position == "ABOVE" then
-			fs:SetPoint("BOTTOM", h, "TOP", db.offsetX, db.offsetY)
-		else
-			fs:SetPoint("TOP", h, "BOTTOM", db.offsetX, db.offsetY)
-		end
-	end
+	-- Place the text before any bar math, so a failure there can't leave it
+	-- without a position.
+	h.stack = 0
+	PlaceText(h, 0)
+	h.bars = Guarded(h, FindCastBars, anchor, plate) or {}
+	h.stackTarget = SafeStackOffset(h)
+	h.stack = h.stackTarget -- snap on (re)anchor; only live changes slide
+	PlaceText(h, h.stack)
 end
 
 ---------------------------------------------------------------------------
@@ -244,12 +418,29 @@ local FACTION_ICONS = {
 }
 
 -- Inline texture for the unit's faction, or "" (neutral, unknown, disabled).
+local OPPOSITE_FACTION = { Horde = "Alliance", Alliance = "Horde" }
+
+local function IconFor(faction)
+	local size = PT.db.factionIconSize -- 0 = match text height
+	return ("|T%s:%d:%d|t "):format(FACTION_ICONS[faction], size, size)
+end
+
 local function FactionIcon(unit)
 	if not PT.db.factionIcon then return "" end
 	local ok, faction = pcall(UnitFactionGroup, unit)
 	if not ok or IsSecret(faction) or not FACTION_ICONS[faction] then return "" end
-	local size = PT.db.factionIconSize -- 0 = match text height
-	return ("|T%s:%d:%d|t "):format(FACTION_ICONS[faction], size, size)
+	-- Same-faction targets are the norm, so by default only flag the other side.
+	-- A neutral player (no faction picked yet) still sees both.
+	if PT.db.factionOnlyEnemy and faction == UnitFactionGroup("player") then return "" end
+	return IconFor(faction)
+end
+
+-- Test mode preview: show the icon a real target would get.
+local function TestFactionIcon()
+	if not PT.db.factionIcon then return "" end
+	local mine = UnitFactionGroup("player")
+	local faction = PT.db.factionOnlyEnemy and OPPOSITE_FACTION[mine] or mine
+	return FACTION_ICONS[faction] and IconFor(faction) or ""
 end
 
 -- Forever replaces realm suffixes with surnames ("First Last"); retail
@@ -310,7 +501,7 @@ end
 
 local function UpdateTest(h, index)
 	StyleYou(h)
-	SetName(h, GetDisplayName("player"), FactionIcon("player"))
+	SetName(h, GetDisplayName("player"), TestFactionIcon())
 	h.text:SetTextColor(ClassColor("player"))
 	ShowYou(h, index % 2 == 0 and PT.db.youMode == "TEXT")
 	h:Show()
@@ -452,7 +643,9 @@ PT:RegisterEvent("ADDON_LOADED")
 function PT:Debug()
 	local function Say(...) print("|cff33ff99PlateTarget|r", ...) end
 	local version, build, _, iface = GetBuildInfo()
-	Say(("client %s (%s), interface %s"):format(version, build, tostring(iface)))
+	local getMeta = (C_AddOns and C_AddOns.GetAddOnMetadata) or GetAddOnMetadata
+	Say(("v%s | client %s (%s), interface %s"):format(
+		getMeta and getMeta(ADDON, "Version") or "?", version, build, tostring(iface)))
 	Say("secret values API:", issecretvalue and "yes" or "no",
 		"| SetAlphaFromBoolean:", (UIParent.SetAlphaFromBoolean and "yes" or "no"),
 		"| Settings panel:", (Settings and Settings.RegisterCanvasLayoutCategory) and "yes" or "no")
@@ -466,8 +659,45 @@ function PT:Debug()
 	for u, h in pairs(active) do
 		if holders[plate] == h then unit = u end
 	end
-	local _, kind = ResolveAnchor(plate)
-	Say("target plate:", unit or "untracked", "| anchored to:", kind)
+	local h = holders[plate]
+	local _, fresh = ResolveAnchor(plate)
+	Say("target plate:", unit or "untracked", "| using:", h and h.anchorKind or "none", "| would pick:", fresh)
+	-- Any value may be secret, so only tostring() touches them.
+	local function S(f, method)
+		local ok, v = pcall(f[method], f)
+		if not ok then return "err" end
+		if IsSecret(v) then return "secret" end
+		return type(v) == "number" and ("%.2f"):format(v):gsub("%.?0+$", "") or tostring(v)
+	end
+	if h and h.bars then
+		Say(("cast bars tracked: %d | push past bars: %.1f"):format(#h.bars, h.stack or 0))
+		for i, bar in ipairs(h.bars) do
+			local okShow, showing = pcall(BarShowing, bar)
+			local okNeed, need = pcall(ClearanceFor, h, bar, PT.db.position ~= "ABOVE")
+			Say(("  bar %d: showing=%s height=%s gap=%s needs=%s"):format(i,
+				okShow and tostring(showing) or "err", S(bar.size, "GetHeight"), tostring(bar.gap),
+				okNeed and tostring(need and ("%.1f"):format(need) or "other side") or ("err: " .. tostring(need))))
+		end
+	end
+	if h and h.lastError then Say("last error:", h.lastError) end
+	local function Describe(label, f)
+		if not f then return end
+		Say(("%s: shown=%s visible=%s alpha=%s strata=%s level=%s scale=%s W=%s H=%s"):format(
+			label, S(f, "IsShown"), S(f, "IsVisible"), S(f, "GetAlpha"),
+			f.GetFrameStrata and S(f, "GetFrameStrata") or "n/a",
+			f.GetFrameLevel and S(f, "GetFrameLevel") or "n/a",
+			S(f, "GetEffectiveScale"), S(f, "GetWidth"), S(f, "GetHeight")))
+	end
+	if h then
+		Describe("anchor", h.anchor)
+		Describe("holder", h)
+		for _, pair in ipairs({ { "name text", h.text }, { "you text", h.you } }) do
+			local label, fs = pair[1], pair[2]
+			local ok, txt = pcall(fs.GetText, fs)
+			Say(("%s: shown=%s alpha=%s string=%s"):format(label, S(fs, "IsShown"), S(fs, "GetAlpha"),
+				ok and (IsSecret(txt) and "secret" or tostring(txt)) or "err"))
+		end
+	end
 	if unit then
 		local tunit = unit .. "target"
 		local _, name = pcall(UnitName, tunit)

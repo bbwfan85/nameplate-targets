@@ -221,6 +221,8 @@ function ns.CreateOptions()
 	Dropdown(panel, "Anchor to", "anchorMode", function()
 		return { { "AUTO", "Health bar (auto-detect)" }, { "PLATE", "Nameplate frame" } }
 	end, L, -430)
+	Checkbox(panel, "Move past cast bars", "avoidBars", L, -474)
+	Checkbox(panel, "Smooth slide", "smoothStack", L + 160, -474)
 
 	-- Right column: text
 	Label(panel, "Text", R, -70)
@@ -229,25 +231,26 @@ function ns.CreateOptions()
 		return { { "FIRST", "First name only" }, { "FULL", "Full name (with surname)" } }
 	end, R, -136)
 	Checkbox(panel, "Faction icon before player names", "factionIcon", R, -182)
-	Slider(panel, "Faction icon size (0 = match text)", "factionIconSize", 0, 32, 1, R, -214)
-	Checkbox(panel, "Show NPC targets (pets, NPCs)", "showNPCTargets", R, -258)
-	ColorSwatch(panel, "NPC target color", "npcColor", R + 4, -288)
+	Checkbox(panel, "Only for the opposite faction", "factionOnlyEnemy", R + 20, -206)
+	Slider(panel, "Faction icon size (0 = match text)", "factionIconSize", 0, 32, 1, R, -238)
+	Checkbox(panel, "Show NPC targets (pets, NPCs)", "showNPCTargets", R, -282)
+	ColorSwatch(panel, "NPC target color", "npcColor", R + 4, -312)
 
-	Label(panel, "When targeting you", R, -322)
+	Label(panel, "When targeting you", R, -344)
 	Dropdown(panel, "Show", "youMode", function()
 		return { { "TEXT", "Custom text" }, { "NAME", "My name" } }
-	end, R, -344)
-	TextInput(panel, "Custom text", "youText", R, -394)
-	Checkbox(panel, "Use custom color (otherwise class color)", "youUseColor", R, -436)
-	ColorSwatch(panel, "Targeting-you color", "youColor", R + 4, -466)
+	end, R, -366)
+	TextInput(panel, "Custom text", "youText", R, -416)
+	Checkbox(panel, "Use custom color (otherwise class color)", "youUseColor", R, -456)
+	ColorSwatch(panel, "Targeting-you color", "youColor", R + 4, -486)
 
-	Label(panel, "Filters", L, -500)
-	Checkbox(panel, "Enabled", "enabled", L, -520)
-	Checkbox(panel, "Enemy nameplates", "showEnemy", L + 140, -520)
-	Checkbox(panel, "Friendly nameplates", "showFriendly", L + 320, -520)
+	Label(panel, "Filters", L, -514)
+	Checkbox(panel, "Enabled", "enabled", L, -534)
+	Checkbox(panel, "Enemy nameplates", "showEnemy", L + 140, -534)
+	Checkbox(panel, "Friendly nameplates", "showFriendly", L + 320, -534)
 
 	local test = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
-	test:SetPoint("TOPLEFT", L, -560)
+	test:SetPoint("TOPLEFT", L, -574)
 	test:SetSize(140, 24)
 	local function SyncTest() test:SetText(PT:IsTestMode() and "Stop test" or "Test mode") end
 	test:SetScript("OnClick", function() PT:SetTestMode(not PT:IsTestMode()); SyncTest() end)

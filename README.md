@@ -11,11 +11,12 @@ Built for **WoW: Forever**, and it also works on retail **Midnight** (both run o
 ## Features
 
 - Target's name in their class color, with a custom format (default `> NAME <`)
-- Horde / Alliance icon before player names (toggle and size)
+- Horde / Alliance icon before player names, by default only for the opposite faction (toggle and size)
 - First name only (default) or full name with surname
 - Custom text and color when the unit is targeting you (default `>> YOU <<`)
 - Font (including LibSharedMedia fonts), size, outline and shadow
 - Above or below the nameplate, with X/Y offsets
+- Slides out of the way of cast bars (and other bars) that appear on the same side
 - Toggles for NPC targets, enemy plates and friendly plates
 - Test mode for setting things up out of combat
 
