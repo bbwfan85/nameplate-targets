@@ -1,0 +1,9 @@
+## Interface: 120000, 120001, 120005, 120007, 16001
+## Title: PlateTarget
+## Notes: Shows who each nameplate's unit is targeting, in that player's class color.
+## Version: 1.0.0
+## SavedVariables: PlateTargetDB
+## OptionalDeps: ElvUI, EllesmereUI, EllesmereUINameplates, LibSharedMedia-3.0
+
+Core.lua
+Options.lua
