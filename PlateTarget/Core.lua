@@ -412,6 +412,41 @@ local function ClassColor(unit)
 	return 1, 1, 1
 end
 
+-- Class-color a font string. In instances the class of "nameplateNtarget"
+-- is secret: we can't index tables with it, but C_ClassColor may accept it
+-- and hand back a color whose channels are secret, which SetTextColor can
+-- still display. Returns how it was colored, for /ptarget debug.
+local function ApplyClassColor(fs, unit)
+	local ok, _, class = pcall(UnitClass, unit)
+	if ok and not IsSecret(class) then
+		fs:SetTextColor(ClassColor(unit))
+		return "class"
+	end
+	if ok and C_ClassColor then
+		local okC, c = pcall(C_ClassColor.GetClassColor, class)
+		if okC and type(c) == "table" and pcall(fs.SetTextColor, fs, c.r, c.g, c.b) then
+			return "secret class"
+		end
+	end
+	fs:SetTextColor(1, 1, 1)
+	return "white (class unavailable)"
+end
+
+-- Whether `unit`'s target is the player: true, false, or a secret boolean.
+-- Comparing a chained token ("nameplate1target") to "player" can be blocked
+-- in instances; then fall back to threat, whose isTanking is true when this
+-- unit's main target is you.
+local function TargetIsYou(unit, tunit)
+	local ok, v = pcall(UnitIsUnit, tunit, "player")
+	if ok and (IsSecret(v) or v ~= nil) then return v, "UnitIsUnit" end
+	local okT, isTanking = pcall(UnitDetailedThreatSituation, "player", unit)
+	if okT then
+		if IsSecret(isTanking) then return isTanking, "threat" end
+		return isTanking and true or false, "threat"
+	end
+	return false, "unavailable"
+end
+
 local FACTION_ICONS = {
 	Horde    = "Interface\\FriendsFrame\\PlusManz-Horde",
 	Alliance = "Interface\\FriendsFrame\\PlusManz-Alliance",
@@ -488,10 +523,11 @@ local function ShowYou(h, isYou)
 	if IsSecret(isYou) then
 		h.text:Show()
 		h.you:Show()
-		local ok1 = pcall(h.you.SetAlphaFromBoolean, h.you, isYou, 1, 0)
-		local ok2 = pcall(h.text.SetAlphaFromBoolean, h.text, isYou, 0, 1)
+		local ok1, err1 = pcall(h.you.SetAlphaFromBoolean, h.you, isYou, 1, 0)
+		local ok2, err2 = pcall(h.text.SetAlphaFromBoolean, h.text, isYou, 0, 1)
 		if ok1 and ok2 then return end
-		isYou = false -- API missing: just show the name
+		h.lastError = tostring(err1 or err2)
+		isYou = false -- API missing or refused: just show the name
 	end
 	h.text:SetAlpha(1)
 	h.you:SetAlpha(1)
@@ -545,15 +581,14 @@ local function UpdateUnit(unit)
 		local c = db.npcColor
 		h.text:SetTextColor(c.r, c.g, c.b)
 	else
-		h.text:SetTextColor(ClassColor(tunit))
+		ApplyClassColor(h.text, tunit)
 	end
 
-	-- UnitIsUnit on "nameplateNtarget" can come back secret in restricted
-	-- content; ShowYou handles that without reading it.
+	-- The answer can be secret in restricted content; ShowYou handles that
+	-- without reading it.
 	local isYou = false
 	if db.youMode == "TEXT" then
-		local okYou, v = pcall(UnitIsUnit, tunit, "player")
-		if okYou then isYou = v end
+		isYou = TargetIsYou(unit, tunit)
 		StyleYou(h)
 	end
 	ShowYou(h, isYou)
@@ -701,11 +736,14 @@ function PT:Debug()
 	if unit then
 		local tunit = unit .. "target"
 		local _, name = pcall(UnitName, tunit)
-		local _, isYou = pcall(UnitIsUnit, tunit, "player")
+		local okIs, isYouRaw = pcall(UnitIsUnit, tunit, "player")
 		local _, _, class = pcall(UnitClass, tunit)
 		Say("its target's name secret:", IsSecret(name) and "yes" or "no",
 			"| class secret:", IsSecret(class) and "yes" or "no",
-			"| is-you secret:", IsSecret(isYou) and "yes" or "no")
+			"| UnitIsUnit:", okIs and (IsSecret(isYouRaw) and "secret" or tostring(isYouRaw)) or ("error: " .. tostring(isYouRaw)))
+		local isYou, via = TargetIsYou(unit, tunit)
+		Say("targeting you:", IsSecret(isYou) and "secret" or tostring(isYou), "(via " .. via .. ")",
+			"| name color:", h and ApplyClassColor(h.text, tunit) or "n/a")
 	end
 end
 
